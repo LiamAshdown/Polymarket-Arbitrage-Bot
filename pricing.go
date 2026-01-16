@@ -1,17 +1,8 @@
 package bot
 
 import (
-	"math"
 	"quadbot/utils"
 )
-
-func roundToTick(price, tick float64) float64 {
-	if tick <= 0 {
-		return price
-	}
-	rounded := math.Round(price/tick) * tick
-	return math.Round(rounded*100) / 100
-}
 
 func makerBuyPrice(bid, ask, tick float64) float64 {
 	// Step inside spread if possible; must remain < ask to stay maker.
@@ -20,16 +11,16 @@ func makerBuyPrice(bid, ask, tick float64) float64 {
 	// If spread is narrow (<2 ticks), join existing bid (back of queue, slower fills)
 	// Tradeoff: Pay slightly more for better queue position while remaining maker.
 	if tick > 0 && (ask-bid) >= 2*tick {
-		return roundToTick(ask-tick, tick)
+		return utils.RoundToTick(ask-tick, tick)
 	}
-	return roundToTick(bid, tick)
+	return utils.RoundToTick(bid, tick)
 }
 
 func makerSellPrice(bid, ask, tick float64) float64 {
 	if tick > 0 && (ask-bid) >= 2*tick {
-		return roundToTick(bid+tick, tick)
+		return utils.RoundToTick(bid+tick, tick)
 	}
-	return roundToTick(ask, tick)
+	return utils.RoundToTick(ask, tick)
 }
 
 func EdgeNet(side string, upPrice, downPrice, qty, buffer float64, feeRateBps int, upIsTaker, downIsTaker bool) (edgeNet float64, feePerPairShare float64) {
@@ -60,4 +51,22 @@ func EdgeBuyNet(upPrice, downPrice, qty, buffer float64, feeRateBps int, upIsTak
 
 func EdgeSellNet(upPrice, downPrice, qty, buffer float64, feeRateBps int, upIsTaker, downIsTaker bool) (edgeNet float64, feePerPairShare float64) {
 	return EdgeNet("SELL", upPrice, downPrice, qty, buffer, feeRateBps, upIsTaker, downIsTaker)
+}
+
+type CompletedPosition struct {
+	Quantity float64
+	Cost     float64
+	Profit   float64
+}
+
+func calculateBinaryPnL(price1 float64, price2 float64, quantity float64) CompletedPosition {
+	totalCost := (price1 + price2) * quantity
+	expectedPayout := quantity * binaryMarketPayout
+	profit := expectedPayout - totalCost
+
+	return CompletedPosition{
+		Quantity: quantity,
+		Cost:     totalCost,
+		Profit:   profit,
+	}
 }

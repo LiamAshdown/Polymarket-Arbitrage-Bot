@@ -88,6 +88,26 @@ func (opm *OrderPairManager) IsBothSidesFilled(pair *PendingOrderPair) bool {
 	return pair.UpOrder.Filled && pair.DownOrder.Filled
 }
 
+func (opm *OrderPairManager) UpdateOrderFill(orderID string, filled bool, filledQty float64, fillPrice float64) (pairID string, bothFilled bool) {
+	opm.mu.Lock()
+	defer opm.mu.Unlock()
+
+	for id, pair := range opm.pendingPairs {
+		if pair.UpOrder.ID == orderID {
+			pair.UpOrder.Filled = filled
+			pair.UpOrder.FilledQuantity = filledQty
+			pair.UpOrder.FillPrice = fillPrice
+			return id, pair.UpOrder.Filled && pair.DownOrder.Filled
+		} else if pair.DownOrder.ID == orderID {
+			pair.DownOrder.Filled = filled
+			pair.DownOrder.FilledQuantity = filledQty
+			pair.DownOrder.FillPrice = fillPrice
+			return id, pair.UpOrder.Filled && pair.DownOrder.Filled
+		}
+	}
+	return "", false
+}
+
 func generatePairID(counter int) string {
 	return fmt.Sprintf("PAIR-%d", counter)
 }

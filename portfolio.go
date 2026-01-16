@@ -11,6 +11,7 @@ type Portfolio struct {
 }
 
 func NewPortfolio(starting float64) *Portfolio {
+
 	return &Portfolio{
 		initial:   starting,
 		available: starting,
@@ -46,17 +47,18 @@ func (p *Portfolio) Fill(orderID string, cost float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	reservedAmt := p.reserved[orderID]
-	if reservedAmt >= cost {
-		p.reserved[orderID] = reservedAmt - cost
-		if p.reserved[orderID] == 0 {
+	if reservedAmt > 0 {
+		if reservedAmt >= cost {
+			p.reserved[orderID] = reservedAmt - cost
+			if p.reserved[orderID] == 0 {
+				delete(p.reserved, orderID)
+			}
+		} else {
+			remainder := cost - reservedAmt
 			delete(p.reserved, orderID)
+			p.available -= remainder
 		}
-	} else if reservedAmt > 0 {
-		remainder := cost - reservedAmt
-		delete(p.reserved, orderID)
-		p.available -= remainder
-	}
-	if reservedAmt == 0 {
+	} else {
 		p.available -= cost
 	}
 	p.spent += cost
