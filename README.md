@@ -17,7 +17,7 @@ Designed with performance in mind, this bot aims to execute orders the moment an
 
 ## Installation
 
-You will need `goland` with the minimum version of `1.24.0`.
+You will need `golang` with the minimum version of `1.24.0`.
 
 There's an `.env.example` that you will need to copy and fill out the environment variables.
 
