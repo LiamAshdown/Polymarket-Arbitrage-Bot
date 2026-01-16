@@ -10,6 +10,7 @@ This bot focuses when the "YES" + "NO" < $1 and places orders as a maker but can
 - Checks hedge liquidity before placing any orders
 - Cancel stale orders if they remain unfilled
 - Handles partial fills by hedging the remaining quantity.
+- Dynamic quantity purchase; automatically adjust order's quantity based on available liquidity
 
 The bot supports both "LIVE" and "PAPER" modes. The "PAPER" mode mimics the live market as closely as possible, using real-time order book data to simulate partial and full fills.
 
