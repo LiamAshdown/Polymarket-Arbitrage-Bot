@@ -8,6 +8,7 @@ import (
 	"quadbot/engine"
 	"quadbot/logger"
 	"quadbot/market"
+	"quadbot/signals"
 	"sync"
 	"time"
 )
@@ -35,6 +36,8 @@ type BotConfig struct {
 	MaxQuantity     float64
 	MaxSpreadBps    float64
 	ScaleWithSpread bool
+
+	Signals signals.SignalConfig
 }
 
 type Bot struct {
@@ -52,6 +55,8 @@ type Bot struct {
 	positionTracker  *PositionTracker
 	portfolio        *Portfolio
 	hedgeOrders      map[string]*HedgeOrderInfo
+
+	signalManager *signals.Manager
 
 	mutex sync.RWMutex
 }
@@ -78,6 +83,8 @@ func NewBot(engine engine.ExecutionEngine, event *market.Event, config BotConfig
 		orderPairManager: NewOrderPairManager(),
 		positionTracker:  NewPositionTracker(logger),
 		hedgeOrders:      make(map[string]*HedgeOrderInfo),
+
+		signalManager: signals.NewManager(config.Signals),
 	}
 
 	bot.wsClient = *client.NewWSMarketClient(client.WSMarketCallbacks{
@@ -100,6 +107,8 @@ func (b *Bot) onPriceChange(msg client.PriceChangeMessage) {
 			Side:        engine.Side(price.Side),
 			Hash:        price.Hash,
 		})
+
+		b.signalManager.UpdateVolume(price.AssetID, float64(price.Size))
 	}
 	b.checkPaperFills(incomingOrders)
 }
@@ -116,6 +125,9 @@ func (b *Bot) onBestBidAsk(msg client.BestBidAskMessage) {
 		Spread:      float64(msg.Spread),
 		TimeStamp:   msg.Timestamp.Time(),
 	}
+
+	midPrice := (float64(msg.BestBid) + float64(msg.BestAsk)) / 2
+	b.signalManager.Update(msg.AssetID, midPrice)
 
 	if quotePair, ok := b.tryBuildQuotePair(); ok {
 		select {
@@ -266,6 +278,10 @@ func (b *Bot) canPlaceOrders(quotePair QuotePair, pricing pricingParams, quantit
 	totalCost := (pricing.upLimit + pricing.downLimit) * quantity
 
 	if !b.portfolio.HasAvailable(totalCost) {
+		return false
+	}
+
+	if !b.signalManager.CheckAll(quotePair.Up.ClobTokenID, quotePair.Down.ClobTokenID) {
 		return false
 	}
 

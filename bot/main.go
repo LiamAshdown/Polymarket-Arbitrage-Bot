@@ -10,6 +10,7 @@ import (
 	"quadbot/engine"
 	"quadbot/logger"
 	service "quadbot/services"
+	"quadbot/signals"
 	"strconv"
 	"time"
 
@@ -141,6 +142,16 @@ func main() {
 		MaxQuantity:     getEnvFloat("MAX_QUANTITY", 5.0),
 		MaxSpreadBps:    getEnvFloat("MAX_SPREAD_BPS", 12500.0),
 		ScaleWithSpread: getEnvBool("SCALE_WITH_SPREAD", true),
+		Signals: signals.SignalConfig{
+			RSIEnabled:    getEnvBool("RSI_ENABLED", true),
+			RSIPeriod:     getEnvInt("RSI_PERIOD", 14),
+			RSIOverbought: getEnvFloat("RSI_OVERBOUGHT", 70.0),
+			RSIOversold:   getEnvFloat("RSI_OVERSOLD", 30.0),
+
+			VolumeEnabled:   getEnvBool("VOLUME_ENABLED", true),
+			VolumePeriod:    getEnvInt("VOLUME_PERIOD", 50),
+			VolumeThreshold: getEnvFloat("VOLUME_THRESHOLD", 1.5),
+		},
 	}, *logger)
 
 	if err := tradingBot.Run(ctx); err != nil {
