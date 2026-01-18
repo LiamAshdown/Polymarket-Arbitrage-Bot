@@ -36,6 +36,20 @@ func (p *Portfolio) Release(orderID string) {
 	}
 }
 
+func (p *Portfolio) ReleasePartial(orderID string, amount float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	reservedAmt := p.reserved[orderID]
+	if reservedAmt > 0 {
+		releaseAmt := min(amount, reservedAmt)
+		p.available += releaseAmt
+		p.reserved[orderID] -= releaseAmt
+		if p.reserved[orderID] <= 0 {
+			delete(p.reserved, orderID)
+		}
+	}
+}
+
 func (p *Portfolio) Spend(amount float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

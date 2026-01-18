@@ -81,6 +81,19 @@ type GeoBlockResponse struct {
 }
 
 // =============================
+// Order Status Types
+// =============================
+
+type OrderStatus string
+
+const (
+	OrderStatusMatched   OrderStatus = "matched"   // Order placed and matched with existing resting order
+	OrderStatusLive      OrderStatus = "live"      // Order placed and resting on the book
+	OrderStatusDelayed   OrderStatus = "delayed"   // Order marketable but subject to matching delay
+	OrderStatusUnmatched OrderStatus = "unmatched" // Order marketable but failure delaying, placement successful
+)
+
+// =============================
 // WebSocket Types
 // =============================
 

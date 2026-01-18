@@ -62,28 +62,18 @@ func (e *LiveEngine) GetBalance(ctx context.Context) (float64, error) {
 	return e.trade.GetBalance(ctx)
 }
 
-func (e *LiveEngine) PlaceOrder(order OrderRequest) PendingOrder {
-	ctx := context.Background()
-
-	if err := e.validateAndRoundOrder(&order); err != nil {
-		e.log.Error("order_validation_failed", "token", order.ClobTokenID, "err", err)
-		pid := utils.GenerateRandomID()
-		po := PendingOrder{ID: pid, Order: order}
-		e.mu.Lock()
-		e.pendingOrders[pid] = &po
-		e.mu.Unlock()
-		return po
+func (e *LiveEngine) signAndPrepareOrder(order *OrderRequest) (*client.PolymarketOrderRequest, error) {
+	if err := e.validateAndRoundOrder(order); err != nil {
+		return nil, err
 	}
-
-	nonce := "0"
 
 	feeRateBps := e.GetFeeString(order.ClobTokenID)
 	if feeRateBps == "0" {
 		e.log.Error("fee_not_cached", "token", order.ClobTokenID)
 	}
 
+	nonce := "0"
 	expiration := int64(0)
-
 	zeroAddress := "0x0000000000000000000000000000000000000000"
 
 	signedOrder, err := e.signer.SignOrder(client.OrderSignParams{
@@ -101,7 +91,30 @@ func (e *LiveEngine) PlaceOrder(order OrderRequest) PendingOrder {
 	})
 
 	if err != nil {
-		e.log.Error("order_signing_failed", "token", order.ClobTokenID, "err", err)
+		return nil, err
+	}
+
+	orderType := "GTC"
+	if !order.Maker {
+		orderType = "FOK"
+	}
+
+	req := &client.PolymarketOrderRequest{
+		Order:     *signedOrder,
+		Owner:     e.cfg.APIKey,
+		OrderType: orderType,
+		PostOnly:  order.Maker,
+	}
+
+	return req, nil
+}
+
+func (e *LiveEngine) PlaceOrder(order OrderRequest) PendingOrder {
+	ctx := context.Background()
+
+	req, err := e.signAndPrepareOrder(&order)
+	if err != nil {
+		e.log.Error("order_preparation_failed", "token", order.ClobTokenID, "err", err)
 		pid := utils.GenerateRandomID()
 		po := PendingOrder{ID: pid, Order: order}
 		e.mu.Lock()
@@ -110,19 +123,7 @@ func (e *LiveEngine) PlaceOrder(order OrderRequest) PendingOrder {
 		return po
 	}
 
-	orderType := "GTC"
-	if !order.Maker {
-		orderType = "FOK"
-	}
-
-	req := client.PolymarketOrderRequest{
-		Order:     *signedOrder,
-		Owner:     e.cfg.APIKey,
-		OrderType: orderType,
-		PostOnly:  order.Maker,
-	}
-
-	resp, err := e.trade.PlaceOrder(ctx, req)
+	resp, err := e.trade.PlaceOrder(ctx, *req)
 	if err != nil {
 		e.log.Error("place_order_failed", "token", order.ClobTokenID, "err", err)
 		pid := utils.GenerateRandomID()
@@ -142,12 +143,147 @@ func (e *LiveEngine) PlaceOrder(order OrderRequest) PendingOrder {
 		FillPrice:      0,
 	}
 
+	// Handle order status
+	switch resp.Status {
+	case client.OrderStatusMatched:
+		// Order filled immediately - mark as filled
+		po.Filled = true
+		po.FilledQuantity = order.Quantity
+		po.FillPrice = order.Price
+		e.log.Info("order_matched", "order_id", resp.OrderID, "price", order.Price, "quantity", order.Quantity)
+
+		// Trigger fill callback if set
+		if e.onFill != nil {
+			e.onFill(&po)
+		}
+		return po
+
+	case client.OrderStatusLive:
+		// Order resting on book - wait for fills via WebSocket
+		e.log.Info("order_live", "order_id", resp.OrderID, "status", "resting_on_book")
+
+	case client.OrderStatusDelayed:
+		// Order marketable but delayed (anti-manipulation)
+		e.log.Warn("order_delayed", "order_id", resp.OrderID, "msg", "order marketable but subject to matching delay")
+
+	case client.OrderStatusUnmatched:
+		// Order marketable but failed to delay - still placed
+		e.log.Warn("order_unmatched", "order_id", resp.OrderID, "msg", "order marketable but failure delaying, placement successful")
+
+	default:
+		e.log.Info("order_placed", "order_id", resp.OrderID, "status", string(resp.Status))
+	}
+
 	e.mu.Lock()
 	e.pendingOrders[po.ID] = &po
 	e.mu.Unlock()
 
-	e.log.Info("order_placed", "order_id", resp.OrderID, "status", resp.Status)
 	return po
+}
+
+func (e *LiveEngine) PlaceBatchOrders(orders []OrderRequest) []PendingOrder {
+	ctx := context.Background()
+
+	if len(orders) == 0 {
+		return []PendingOrder{}
+	}
+
+	if len(orders) > 15 {
+		e.log.Error("batch_limit_exceeded", "count", len(orders), "max", 15)
+		return []PendingOrder{}
+	}
+
+	requests := make([]client.PolymarketOrderRequest, 0, len(orders))
+	pendingOrders := make([]PendingOrder, 0, len(orders))
+
+	for i := range orders {
+		req, err := e.signAndPrepareOrder(&orders[i])
+		if err != nil {
+			e.log.Error("batch_order_preparation_failed", "token", orders[i].ClobTokenID, "err", err)
+			continue
+		}
+		requests = append(requests, *req)
+	}
+
+	if len(requests) == 0 {
+		e.log.Error("no_valid_orders_to_batch")
+		return []PendingOrder{}
+	}
+
+	responses, err := e.trade.PlaceBatchOrders(ctx, requests)
+	if err != nil {
+		e.log.Error("batch_order_failed", "err", err)
+		return []PendingOrder{}
+	}
+
+	e.mu.Lock()
+	for i, resp := range responses {
+		if !resp.Success || len(resp.ErrorMsg) > 0 {
+			e.log.Error("batch_order_placement_failed",
+				"index", i,
+				"token", orders[i].ClobTokenID,
+				"error", resp.ErrorMsg)
+			continue
+		}
+
+		po := PendingOrder{
+			ID:             resp.OrderID,
+			Order:          orders[i],
+			PlacedAt:       time.Now(),
+			Filled:         false,
+			FilledQuantity: 0,
+			FillPrice:      0,
+		}
+
+		switch resp.Status {
+		case client.OrderStatusMatched:
+			// Order filled immediately
+			po.Filled = true
+			po.FilledQuantity = orders[i].Quantity
+			po.FillPrice = orders[i].Price
+			e.log.Info("batch_order_matched",
+				"order_id", resp.OrderID,
+				"index", i,
+				"price", orders[i].Price,
+				"quantity", orders[i].Quantity)
+
+			// Trigger fill callback if order matched immediately
+			if e.onFill != nil {
+				pointerCopy := po
+				e.onFill(&pointerCopy)
+			}
+
+		case client.OrderStatusLive:
+			e.log.Info("batch_order_live",
+				"order_id", resp.OrderID,
+				"index", i,
+				"status", "resting_on_book")
+
+		case client.OrderStatusDelayed:
+			e.log.Warn("batch_order_delayed",
+				"order_id", resp.OrderID,
+				"index", i,
+				"msg", "order marketable but delayed")
+
+		case client.OrderStatusUnmatched:
+			e.log.Warn("batch_order_unmatched",
+				"order_id", resp.OrderID,
+				"index", i,
+				"msg", "order placement successful but delayed")
+
+		default:
+			e.log.Info("batch_order_placed",
+				"order_id", resp.OrderID,
+				"status", string(resp.Status),
+				"index", i)
+		}
+
+		e.pendingOrders[po.ID] = &po
+		pendingOrders = append(pendingOrders, po)
+	}
+	e.mu.Unlock()
+
+	return pendingOrders
 }
 
 func (e *LiveEngine) CancelOrder(orderID string) error {

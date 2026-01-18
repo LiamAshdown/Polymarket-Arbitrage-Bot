@@ -6,6 +6,7 @@ type ExecutionEngine interface {
 	Name() string
 
 	PlaceOrder(order OrderRequest) PendingOrder
+	PlaceBatchOrders(orders []OrderRequest) []PendingOrder
 	CancelOrder(orderID string) error
 
 	CheckFill(orderID string, incomingOrder IncomingOrder) *FillResult

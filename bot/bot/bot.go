@@ -55,6 +55,7 @@ type Bot struct {
 	positionTracker  *PositionTracker
 	portfolio        *Portfolio
 	hedgeOrders      map[string]*HedgeOrderInfo
+	orphanedOrders   map[string]engine.PendingOrder // Orders being canceled that might fill
 
 	signalManager *signals.Manager
 
@@ -69,9 +70,9 @@ type HedgeOrderInfo struct {
 	FilledOrder   engine.PendingOrder
 }
 
-func NewBot(engine engine.ExecutionEngine, event *market.Event, config BotConfig, logger logger.Logger) *Bot {
+func NewBot(executionEngine engine.ExecutionEngine, event *market.Event, config BotConfig, logger logger.Logger) *Bot {
 	bot := &Bot{
-		engine: engine,
+		engine: executionEngine,
 		event:  event,
 		logger: logger,
 		config: config,
@@ -83,6 +84,7 @@ func NewBot(engine engine.ExecutionEngine, event *market.Event, config BotConfig
 		orderPairManager: NewOrderPairManager(),
 		positionTracker:  NewPositionTracker(logger),
 		hedgeOrders:      make(map[string]*HedgeOrderInfo),
+		orphanedOrders:   make(map[string]engine.PendingOrder),
 
 		signalManager: signals.NewManager(config.Signals),
 	}
@@ -303,21 +305,40 @@ func (b *Bot) canPlaceOrders(quotePair QuotePair, pricing pricingParams, quantit
 }
 
 func (b *Bot) placeOrderPair(quotePair QuotePair, pricing pricingParams, quantity float64) {
-	upOrder := b.engine.PlaceOrder(engine.OrderRequest{
-		ClobTokenID: quotePair.Up.ClobTokenID,
-		Side:        engine.BUY,
-		Price:       pricing.upLimit,
-		Quantity:    quantity,
-		Maker:       true,
+	orders := b.engine.PlaceBatchOrders([]engine.OrderRequest{
+		{
+			ClobTokenID: quotePair.Up.ClobTokenID,
+			Side:        engine.BUY,
+			Price:       pricing.upLimit,
+			Quantity:    quantity,
+			Maker:       true,
+		},
+		{
+			ClobTokenID: quotePair.Down.ClobTokenID,
+			Side:        engine.BUY,
+			Price:       pricing.downLimit,
+			Quantity:    quantity,
+			Maker:       true,
+		},
 	})
 
-	downOrder := b.engine.PlaceOrder(engine.OrderRequest{
-		ClobTokenID: quotePair.Down.ClobTokenID,
-		Side:        engine.BUY,
-		Price:       pricing.downLimit,
-		Quantity:    quantity,
-		Maker:       true,
-	})
+	if len(orders) != 2 {
+		// Partial success. Cancel any orders that did go through
+		// Track them in case they fill before cancel arrives
+		b.mutex.Lock()
+		for i := range orders {
+			b.orphanedOrders[orders[i].ID] = orders[i]
+		}
+		b.mutex.Unlock()
+
+		for _, order := range orders {
+			b.engine.CancelOrder(order.ID)
+		}
+		return
+	}
+
+	upOrder := orders[0]
+	downOrder := orders[1]
 
 	b.portfolio.Reserve(upOrder.ID, upOrder.Order.Price*upOrder.Order.Quantity)
 	b.portfolio.Reserve(downOrder.ID, downOrder.Order.Price*downOrder.Order.Quantity)
@@ -462,17 +483,20 @@ func (b *Bot) hedgePosition(pairID string, filledOrder *engine.PendingOrder, unf
 		Maker:       false,
 	})
 
+	cost := takerPrice * quantity
+	if !b.portfolio.HasAvailable(cost) {
+		b.logger.Error("insufficient_funds_for_hedge", "required", cost, "pair_id", pairID)
+		return
+	}
+
+	b.portfolio.Reserve(hedgeOrder.ID, cost)
+
 	if b.engine.Name() == "paper" {
-		cost := takerPrice * quantity
-		if !b.portfolio.HasAvailable(cost) {
-			b.logger.Error("insufficient_funds_for_hedge", "required", cost, "pair_id", pairID)
-			return
-		}
-		b.portfolio.Spend(cost)
-		position := calculateBinaryPnL(filledOrder.FillPrice, takerPrice, quantity)
+		b.portfolio.Fill(hedgeOrder.ID, hedgeOrder.FillPrice*hedgeOrder.FilledQuantity)
+		position := calculateBinaryPnL(filledOrder.FillPrice, hedgeOrder.FillPrice, hedgeOrder.FilledQuantity)
 		b.positionTracker.RecordCompletedPair(position.Quantity, position.Cost, position.Profit)
 	} else {
-		b.portfolio.Reserve(hedgeOrder.ID, takerPrice*quantity)
+		// Live engine: wait for fill callback
 		b.mutex.Lock()
 		b.hedgeOrders[hedgeOrder.ID] = &HedgeOrderInfo{
 			OrderID:       hedgeOrder.ID,
@@ -488,7 +512,53 @@ func (b *Bot) hedgePosition(pairID string, filledOrder *engine.PendingOrder, unf
 func (b *Bot) handleLiveFill(filledOrder *engine.PendingOrder) {
 	b.mutex.RLock()
 	hedgeInfo, isHedge := b.hedgeOrders[filledOrder.ID]
+	orphanedOrder, isOrphaned := b.orphanedOrders[filledOrder.ID]
 	b.mutex.RUnlock()
+
+	if isOrphaned {
+		b.logger.Warn("orphaned_order_filled",
+			"order_id", filledOrder.ID,
+			"token", orphanedOrder.Order.ClobTokenID,
+			"quantity", filledOrder.FilledQuantity)
+
+		b.mutex.Lock()
+		delete(b.orphanedOrders, filledOrder.ID)
+		b.mutex.Unlock()
+
+		clobToken := b.event.GetClobToken()
+		hedgeTokenID := clobToken.DownId
+		if orphanedOrder.Order.ClobTokenID == clobToken.DownId {
+			hedgeTokenID = clobToken.UpId
+		}
+
+		b.mutex.RLock()
+		quote, hasQuote := b.quotes[hedgeTokenID]
+		b.mutex.RUnlock()
+
+		if !hasQuote {
+			b.logger.Error("cannot_hedge_orphan_no_quote", "token", hedgeTokenID)
+			return
+		}
+
+		hedgeOrder := b.engine.PlaceOrder(engine.OrderRequest{
+			ClobTokenID: hedgeTokenID,
+			Side:        engine.BUY,
+			Price:       quote.BestAsk,
+			Quantity:    filledOrder.FilledQuantity,
+			Maker:       false,
+		})
+
+		cost := quote.BestAsk * filledOrder.FilledQuantity
+		b.portfolio.Reserve(hedgeOrder.ID, cost)
+
+		if b.engine.Name() == "paper" {
+			b.portfolio.Fill(hedgeOrder.ID, hedgeOrder.FillPrice*hedgeOrder.FilledQuantity)
+			position := calculateBinaryPnL(filledOrder.FillPrice, hedgeOrder.FillPrice, hedgeOrder.FilledQuantity)
+			b.positionTracker.RecordCompletedPair(position.Quantity, position.Cost, position.Profit)
+		}
+
+		return
+	}
 
 	if isHedge {
 		b.portfolio.Fill(hedgeInfo.OrderID, filledOrder.FillPrice*filledOrder.FilledQuantity)
@@ -552,38 +622,44 @@ func (b *Bot) cancelStaleOrders() {
 	}
 
 	for _, pair := range stalePairs {
-		upFilled := pair.UpOrder.FilledQuantity
-		downFilled := pair.DownOrder.FilledQuantity
-
-		if upFilled > 0 && downFilled > 0 {
-			matchedQty := min(upFilled, downFilled)
-			if matchedQty > 0 {
-				b.handlePairCompletion(pair)
-			}
-
-			unmatchedQty := upFilled - downFilled
-			if unmatchedQty > 0 {
-				b.hedgePosition(pair.ID, &pair.UpOrder, &pair.DownOrder, unmatchedQty)
-			} else if unmatchedQty < 0 {
-				b.hedgePosition(pair.ID, &pair.DownOrder, &pair.UpOrder, -unmatchedQty)
-			}
-		} else if upFilled > 0 {
-			b.hedgePosition(pair.ID, &pair.UpOrder, &pair.DownOrder, upFilled)
-		} else if downFilled > 0 {
-			b.hedgePosition(pair.ID, &pair.DownOrder, &pair.UpOrder, downFilled)
-		}
-
-		if !pair.UpOrder.Filled {
-			b.engine.CancelOrder(pair.UpOrder.ID)
-			b.portfolio.Release(pair.UpOrder.ID)
-		}
-		if !pair.DownOrder.Filled {
-			b.engine.CancelOrder(pair.DownOrder.ID)
-			b.portfolio.Release(pair.DownOrder.ID)
-		}
-
+		b.handleStalePair(pair)
 		b.orderPairManager.Remove(pair.ID)
 	}
+}
+
+func (b *Bot) handleStalePair(pair *PendingOrderPair) {
+	upFilled := pair.UpOrder.FilledQuantity
+	downFilled := pair.DownOrder.FilledQuantity
+	matchedQty := min(upFilled, downFilled)
+
+	if matchedQty > 0 {
+		b.handlePairCompletion(pair)
+	}
+
+	unmatchedQty := upFilled - downFilled
+	if unmatchedQty > 0 {
+		b.portfolio.Fill(pair.UpOrder.ID, pair.UpOrder.FillPrice*unmatchedQty)
+		b.hedgePosition(pair.ID, &pair.UpOrder, &pair.DownOrder, unmatchedQty)
+	} else if unmatchedQty < 0 {
+		excessQty := -unmatchedQty
+		b.portfolio.Fill(pair.DownOrder.ID, pair.DownOrder.FillPrice*excessQty)
+		b.hedgePosition(pair.ID, &pair.DownOrder, &pair.UpOrder, excessQty)
+	}
+
+	b.cancelUnfilledOrder(&pair.UpOrder)
+	b.cancelUnfilledOrder(&pair.DownOrder)
+}
+
+func (b *Bot) cancelUnfilledOrder(order *engine.PendingOrder) {
+	if order.Filled {
+		return
+	}
+
+	b.engine.CancelOrder(order.ID)
+
+	unfilledQty := order.Order.Quantity - order.FilledQuantity
+	unfilledAmount := unfilledQty * order.Order.Price
+	b.portfolio.ReleasePartial(order.ID, unfilledAmount)
 }
 
 func (b *Bot) Run(ctx context.Context) error {
@@ -595,6 +671,8 @@ func (b *Bot) Run(ctx context.Context) error {
 		b.logger.Error("failed_to_get_balance", "error", err)
 		cancel()
 	}
+
+	balance = 100
 
 	if balance <= 0 {
 		b.logger.Error("not_enough_balance", "msg", "Your balance is 0. Bot cannot run. Shutting down")

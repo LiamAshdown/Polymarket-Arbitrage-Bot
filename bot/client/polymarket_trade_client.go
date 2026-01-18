@@ -48,11 +48,19 @@ type PolymarketOrderRequest struct {
 }
 
 type PolymarketOrderResponse struct {
-	Success     bool     `json:"success"`
-	ErrorMsg    string   `json:"errorMsg"`
-	OrderID     string   `json:"orderId"`
-	OrderHashes []string `json:"orderHashes"`
-	Status      string   `json:"status"` // "matched", "live", "delayed", "unmatched"
+	Success     bool        `json:"success"`
+	ErrorMsg    string      `json:"errorMsg"`
+	OrderID     string      `json:"orderId"`
+	OrderHashes []string    `json:"orderHashes"`
+	Status      OrderStatus `json:"status"`
+}
+
+type PolymarketBatchOrderRequest struct {
+	Orders []PolymarketOrderRequest `json:"orders"`
+}
+
+type PolymarketBatchOrderResponse struct {
+	Responses []PolymarketOrderResponse `json:"responses"`
 }
 
 func (tc *PolymarketTradeClient) PlaceOrder(ctx context.Context, req PolymarketOrderRequest) (*PolymarketOrderResponse, error) {
@@ -105,6 +113,62 @@ func (tc *PolymarketTradeClient) PlaceOrder(ctx context.Context, req PolymarketO
 	}
 
 	return &result, nil
+}
+
+func (tc *PolymarketTradeClient) PlaceBatchOrders(ctx context.Context, orders []PolymarketOrderRequest) ([]PolymarketOrderResponse, error) {
+	if tc.auth == nil {
+		return nil, errors.New("auth required: missing Polymarket L2 credentials")
+	}
+
+	if len(orders) == 0 {
+		return nil, errors.New("no orders provided")
+	}
+
+	if len(orders) > 15 {
+		return nil, errors.New("maximum 15 orders per batch")
+	}
+
+	endpoint := "/orders"
+
+	buf := &bytes.Buffer{}
+	encoder := json.NewEncoder(buf)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "")
+	if err := encoder.Encode(orders); err != nil {
+		return nil, err
+	}
+
+	bodyBytes := bytes.TrimSpace(buf.Bytes())
+	bodyStr := string(bodyBytes)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, tc.baseUrl+endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	if err := tc.auth.SignWithBody(httpReq, bodyStr); err != nil {
+		return nil, err
+	}
+
+	resp, err := tc.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errBody bytes.Buffer
+		errBody.ReadFrom(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, errBody.String())
+	}
+
+	var results []PolymarketOrderResponse
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+
+	return results, nil
 }
 
 type PolymarketCancelResponse struct {

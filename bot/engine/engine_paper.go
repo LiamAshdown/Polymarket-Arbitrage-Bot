@@ -75,6 +75,17 @@ func (e *PaperEngine) PlaceOrder(order OrderRequest) PendingOrder {
 	return *pendingOrder
 }
 
+func (e *PaperEngine) PlaceBatchOrders(orders []OrderRequest) []PendingOrder {
+	pendingOrders := make([]PendingOrder, 0, len(orders))
+
+	for _, order := range orders {
+		pendingOrder := e.PlaceOrder(order)
+		pendingOrders = append(pendingOrders, pendingOrder)
+	}
+
+	return pendingOrders
+}
+
 func (e *PaperEngine) CancelOrder(orderID string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()

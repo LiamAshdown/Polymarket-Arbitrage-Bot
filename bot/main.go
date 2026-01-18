@@ -36,8 +36,6 @@ func main() {
 		engineMode = "paper"
 	}
 
-	engineMode = "paper"
-
 	gammaClient := client.NewGammaClient()
 	clobClient := client.NewClobClient()
 	apiClient := client.NewAPIClient()
